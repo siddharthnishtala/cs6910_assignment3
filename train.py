@@ -1,3 +1,4 @@
+from lib.models import EncoderDecoder
 from lib.utils import load_lexicons
 import wandb
 
@@ -68,3 +69,8 @@ CONFIG = {
 
 # Loading the datasets
 train_dataset, val_dataset, test_dataset = load_lexicons(CONFIG)
+
+# Training and evaluating the model
+model = EncoderDecoder(CONFIG)
+model.train(train_dataset, val_dataset)
+model.evaluate(test_dataset, "test", write_to_file=True, plot_preds=True)
