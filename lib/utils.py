@@ -1,3 +1,10 @@
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.data import Dataset
+
+from collections import OrderedDict
+
+import tensorflow as tf
 import numpy as np
 import joblib
 import os
@@ -5,150 +12,124 @@ import os
 
 def _parse_data(subset, lang="hi"):
 
+    # Path to read data from
     data_path = os.path.join(
-        "dakshina_dataset_v1.0/", 
-        lang, 
-        "lexicons", 
-        lang + ".translit.sampled." + subset + ".tsv"
+        "dakshina_dataset_v1.0/",
+        lang,
+        "lexicons",
+        lang + ".translit.sampled." + subset + ".tsv",
     )
 
     with open(data_path, "r", encoding="utf-8") as f:
         lines = f.read().split("\n")
 
     input_texts, target_texts = [], []
-    input_characters, target_characters = set(), set()
 
     for line in lines:
 
+        # Skip lines that do not meet the expected format
         if len(line.split("\t")) < 3:
             continue
 
+        # Get the input and target word
         input_text, target_text, _ = line.split("\t")
+
+        # Add start and end token to the target word
         target_text = "\t" + target_text + "\n"
 
         input_texts.append(input_text)
         target_texts.append(target_text)
 
-        for char in input_text:
-            if char not in input_characters:
-                input_characters.add(char)
-
-        for char in target_text:
-            if char not in target_characters:
-                target_characters.add(char)
-
-    if subset == "train":
-
-        if ' ' not in input_characters:
-            input_characters.add(' ')
-                    
-        if ' ' not in target_characters:
-            target_characters.add(' ')
-
-        input_characters = sorted(list(input_characters))
-        target_characters = sorted(list(target_characters))
-
-        num_encoder_tokens = len(input_characters)
-        num_decoder_tokens = len(target_characters)
-
-        max_encoder_seq_length = max([len(txt) for txt in input_texts])
-        max_decoder_seq_length = max([len(txt) for txt in target_texts])
-
-        input_token_index = dict([(char, i) for i, char in enumerate(input_characters)])
-        target_token_index = dict([(char, i) for i, char in enumerate(target_characters)])
-
-        dataset_params = {
-            "input_characters": input_characters,
-            "target_characters": target_characters,
-            "num_encoder_tokens": num_encoder_tokens,
-            "num_decoder_tokens": num_decoder_tokens,
-            "max_encoder_seq_length": max_encoder_seq_length,
-            "max_decoder_seq_length": max_decoder_seq_length,
-            "input_token_index": input_token_index,
-            "target_token_index": target_token_index,
-        }
-
-    else:
-        dataset_params = None
-
-    return input_texts, target_texts, dataset_params
+    return input_texts, target_texts
 
 
-def _text_conv(input_texts, target_texts, dataset_params):
+def _get_valid_labels(texts, labels):
+    """
+    Since each input word can have multiple possible labels, a dictionary is
+    made with the input word as key and a list of all possible labels as value
+    """
+    valid_labels = OrderedDict()
+    for text, label in zip(texts, labels):
+        if text not in valid_labels.keys():
+            valid_labels[text] = [label[1:-1]]
+        else:
+            valid_labels[text].append(label[1:-1])
 
-    encoder_input_data = np.zeros(
-        (
-            len(input_texts), 
-            dataset_params["max_encoder_seq_length"], 
-            dataset_params["num_encoder_tokens"]
-        ), 
-        dtype="float32"
-    )
-    decoder_input_data = np.zeros(
-        (
-            len(input_texts), 
-            dataset_params["max_decoder_seq_length"], 
-            dataset_params["num_decoder_tokens"]
-        ), 
-        dtype="float32"
-    )
-    decoder_target_data = np.zeros(
-        (
-            len(input_texts), 
-            dataset_params["max_decoder_seq_length"], 
-            dataset_params["num_decoder_tokens"]
-        ), 
-        dtype="float32"
-    )
+    return valid_labels
 
-    input_token_index = dataset_params["input_token_index"]
-    target_token_index = dataset_params["target_token_index"]
-
-    for i, (input_text, target_text) in enumerate(zip(input_texts, target_texts)):
-
-        for t, char in enumerate(input_text):
-            
-            encoder_input_data[i, t, input_token_index[char]] = 1.0
-
-        encoder_input_data[i, t+1:, input_token_index[" "]] = 1.0
-
-        for t, char in enumerate(target_text):
-            
-            decoder_input_data[i, t, target_token_index[char]] = 1.0
-            
-            if t > 0:
-                decoder_target_data[i, t-1, target_token_index[char]] = 1.0
-
-        decoder_input_data[i, t+1:, target_token_index[" "]] = 1.0
-        decoder_target_data[i, t:, target_token_index[" "]] = 1.0
-
-    return encoder_input_data, decoder_input_data, decoder_target_data
 
 def load_lexicons(config):
 
-    save_path = os.path.join(
-        "dakshina_dataset_v1.0/", 
-        config["data"]["language"], 
-        "lexicons", 
-        "processed_datasets.pkl"
+    # Read each set from the respective file from the dataset
+    train_texts, train_labels = _parse_data("train", config["data"]["language"])
+    val_texts, val_labels = _parse_data("dev", config["data"]["language"])
+    test_texts, test_labels = _parse_data("test", config["data"]["language"])
+
+    # Save all the relevant information that will be used later
+    config["data"]["num_train_examples"] = len(train_texts)
+    config["data"]["val_texts"] = val_texts
+    config["data"]["test_texts"] = test_texts
+    config["data"]["val_labels"] = _get_valid_labels(val_texts, val_labels)
+    config["data"]["test_labels"] = _get_valid_labels(test_texts, test_labels)
+
+    # Character level tokenization for source language
+    source_lang_tokenizer = Tokenizer(char_level=True)
+    source_lang_tokenizer.fit_on_texts(train_texts)
+
+    # Character level tokenization for target language
+    target_lang_tokenizer = Tokenizer(char_level=True)
+    target_lang_tokenizer.fit_on_texts(train_labels)
+
+    # Saving the tokenizers and vocab lengths
+    config["data"]["source_vocab_size"] = len(source_lang_tokenizer.word_index) + 1
+    config["data"]["target_vocab_size"] = len(target_lang_tokenizer.word_index) + 1
+    config["data"]["source_lang_tokenizer"] = source_lang_tokenizer
+    config["data"]["target_lang_tokenizer"] = target_lang_tokenizer
+
+    # Tokenizing and padding training data
+    train_inputs = source_lang_tokenizer.texts_to_sequences(train_texts)
+    train_labels = target_lang_tokenizer.texts_to_sequences(train_labels)
+    train_inputs = pad_sequences(train_inputs, padding="post")
+    train_labels = pad_sequences(train_labels, padding="post")
+
+    # Saving max sequence lengths
+    config["data"]["max_length_input"] = train_inputs.shape[1]
+    config["data"]["max_length_output"] = train_labels.shape[1]
+
+    # Tokenizing and padding validation data
+    val_inputs = source_lang_tokenizer.texts_to_sequences(val_texts)
+    val_labels = target_lang_tokenizer.texts_to_sequences(val_labels)
+    val_inputs = pad_sequences(val_inputs, padding="post", maxlen=train_inputs.shape[1])
+    val_labels = pad_sequences(val_labels, padding="post", maxlen=train_labels.shape[1])
+
+    # Creating a training dataset for the training loop
+    train_dataset = Dataset.from_tensor_slices((train_inputs, train_labels))
+    train_dataset = train_dataset.shuffle(len(train_texts)).batch(
+        config["train"]["batch_size"], drop_remainder=True
     )
 
-    if os.path.exists(save_path):
-        datasets = joblib.load(save_path)
-        train_dataset, val_dataset, test_dataset, dataset_params = datasets
-    else:
-        train_texts, train_labels, dataset_params = _parse_data("train", config["data"]["language"])
-        val_texts, val_labels, _ = _parse_data("dev", config["data"]["language"])
-        test_texts, test_labels, _ = _parse_data("test", config["data"]["language"])
+    # Creating a validation dataset for tracking performance in the training loop
+    val_dataset = Dataset.from_tensor_slices((val_inputs, val_labels))
+    val_dataset = (
+        val_dataset.repeat()
+        .shuffle(len(val_texts))
+        .batch(config["train"]["batch_size"], drop_remainder=True)
+    )
 
-        train_dataset = _text_conv(train_texts, train_labels, dataset_params)
-        val_dataset = _text_conv(val_texts, val_labels, dataset_params)
-        test_dataset = _text_conv(test_texts, test_labels, dataset_params)
+    # Creating a tensor with validation data for evaluation in the training loop
+    val_X = source_lang_tokenizer.texts_to_sequences(
+        list(config["data"]["val_labels"].keys())
+    )
+    val_X = pad_sequences(val_X, padding="post", maxlen=train_inputs.shape[1])
 
-        datasets = (train_dataset, val_dataset, test_dataset, dataset_params)
-        joblib.dump(datasets, save_path)
+    # Creating a tensor with test data for final evaluation
+    test_X = source_lang_tokenizer.texts_to_sequences(
+        list(config["data"]["test_labels"].keys())
+    )
+    test_X = pad_sequences(test_X, padding="post", maxlen=train_inputs.shape[1])
 
-    config["data"]["num_encoder_tokens"] = dataset_params["num_encoder_tokens"]
-    config["data"]["num_decoder_tokens"] = dataset_params["num_decoder_tokens"]
-
-    return train_dataset, val_dataset, test_dataset
+    return (
+        train_dataset,
+        (val_dataset, val_X),
+        test_X,
+    )
