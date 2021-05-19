@@ -10,6 +10,7 @@ from tensorflow.keras.layers import (
     Dense,
 )
 from tensorflow_addons.seq2seq import (
+    GreedyEmbeddingSampler,
     BahdanauAttention,
     AttentionWrapper,
     BeamSearchDecoder,
@@ -112,6 +113,7 @@ class Decoder(Model):
                 rnn_cell,
                 self.attention_mechanism,
                 attention_layer_size=config["model"]["decoder"]["units"],
+                alignment_history=True,
             )
         else:
             self.rnn_cell = StackedRNNCells(rnn_cells)
@@ -193,6 +195,7 @@ class Decoder(Model):
             sequence_length=self.config["train"]["batch_size"]
             * [self.config["data"]["max_length_output"] - 1],
         )
+
         return outputs
 
 
@@ -209,6 +212,14 @@ class EncoderDecoder:
             self.optimizer = Adam()
         else:
             self.optimizer = Nadam()
+
+        # Greedy Decoder
+        self.greedy_decoder = BasicDecoder(
+            self.decoder.rnn_cell,
+            GreedyEmbeddingSampler(),
+            output_layer=self.decoder.fc,
+            maximum_iterations=config["data"]["max_length_output"],
+        )
 
         # Beam Search Object (will be called during inference)
         self.beam_decoder = BeamSearchDecoder(
@@ -324,6 +335,9 @@ class EncoderDecoder:
                     "val_accuracy": val_accuracy,
                 }
             )
+
+        self._plot_attention_maps(val_dataset[1])
+
 
     def evaluate(self, inputs, title, write_to_file=False, plot_preds=False):
 
@@ -448,4 +462,180 @@ class EncoderDecoder:
                     path + "/predictions_vanilla.csv", index=False
                 )
 
+        # Plot correct and incorrect predictions
+        if plot_preds:
+            self._plot_predictions(predictions)
+
         return accuracy
+
+    def _plot_predictions(self, predictions):
+
+        # Seperate correctly predicted examples from incorrectly predicted examples
+        correct_predictions = predictions[predictions["isAccurate"] == True][
+            ["Native Script", "Predicted Latin Script"]
+        ].sample(20)
+        incorrect_predictions = predictions[predictions["isAccurate"] == False][
+            ["Native Script", "Predicted Latin Script"]
+        ].sample(20)
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+        # Plot a table with correct predictions
+        self._plot_table_with_predictions(
+            correct_predictions, "Correct Predictions", axes[0]
+        )
+
+        # Plot a table with incorrect predictions
+        self._plot_table_with_predictions(
+            incorrect_predictions, "Incorrect Predictions", axes[1]
+        )
+
+        fig.tight_layout()
+        wandb.log({"Correct & Incorrect Predictions": wandb.Image(fig)})
+
+    def _plot_table_with_predictions(self, predictions, title, ax):
+
+        # Getting the font properties to write in English and Devanagri
+        eng_font_prop = fm.FontProperties(fname="./lib/Nirmala.ttf")
+        lang_font_prop = fm.FontProperties(fname="./lib/NotoSansD.ttf")
+        header_color = "#40466e"
+        row_colors = ["#f1f1f2", "w"]
+
+        # Plotting a table with the data from the dataframe
+        table = ax.table(
+            cellText=predictions.values,
+            colWidths=[0.25] * len(predictions.columns),
+            colLabels=predictions.columns,
+            cellLoc="center",
+            rowLoc="center",
+            loc="center",
+        )
+        ax.axis("off")
+        ax.set_title(title)
+        table.auto_set_font_size(False)
+        table.set_fontsize(12)
+
+        for k, cell in table._cells.items():
+            cell.set_edgecolor("w")
+
+            # Setting font properties depedning on language
+            if k[0] > 0 and k[1] == 0:
+                cell.get_text().set_fontproperties(lang_font_prop)
+            else:
+                cell.get_text().set_fontproperties(eng_font_prop)
+
+            # Table coloring and formating
+            if k[0] == 0:
+                cell.set_text_props(weight="bold", color="w")
+                cell.set_facecolor("#40466e")
+            else:
+                cell.set_facecolor(row_colors[k[0] % len(row_colors)])
+
+    def _plot_attention_maps(self, inputs):
+
+        inference_batch_size = inputs.shape[0]
+
+        # Pass the inputs through the encoder network
+        enc_out, states = self.encoder(inputs)
+
+        # Tile the encoder outputs and hidden states for beam search
+        if self.config["model"]["attention"]:
+            self.decoder.attention_mechanism.setup_memory(enc_out)
+            hidden_state = self.decoder.build_initial_state(
+                inference_batch_size,
+                states,
+                tf.float32,
+            )
+        else:
+            if self.config["model"]["cell_type"] != "LSTM":
+                states = states[0]
+
+            hidden_state = self.decoder.get_initial_state(states)
+
+            if self.config["model"]["decoder"]["layers"] == 1:
+                hidden_state = (hidden_state,)
+            else:
+                if self.config["model"]["cell_type"] == "LSTM":
+                    hidden_state = tuple(
+                        [hidden_state[2 * i], hidden_state[2 * i + 1]]
+                        for i in range(int(len(hidden_state) / 2))
+                    )
+                else:
+                    hidden_state = tuple(hidden_state)
+
+        # Start and end tokens for beam search
+        start_tokens = tf.fill(
+            [inference_batch_size],
+            self.config["data"]["target_lang_tokenizer"].word_index["\t"],
+        )
+        end_token = self.config["data"]["target_lang_tokenizer"].word_index["\n"]
+
+        decoder_embedding_matrix = self.decoder.embedding.variables[0]
+
+        # Running beam search
+        outputs, final_state, sequence_lengths = self.greedy_decoder(
+            decoder_embedding_matrix,
+            start_tokens=start_tokens,
+            end_token=end_token,
+            initial_state=hidden_state,
+        )
+
+        alignments = tf.transpose(final_state.alignment_history.stack(), [1, 2, 0])
+
+        alignments = alignments.numpy()
+
+        fig, axes = plt.subplots(3, 3, figsize=(9, 9))
+
+        # Getting the inputs and allowed labels
+        labels = self.config["data"]["val_labels"]
+        texts = list(labels.keys())
+
+        outputs = self.config["data"]["target_lang_tokenizer"].sequences_to_texts(
+            outputs.sample_id.numpy()
+        )
+
+        # Getting the font properties to write in English and Devanagri
+        eng_font_prop = fm.FontProperties(fname="./lib/Nirmala.ttf")
+        lang_font_prop = fm.FontProperties(fname="./lib/NotoSansD.ttf")
+
+        rand_idx = np.random.permutation(alignments.shape[0])[:9]
+        for i in range(3):
+            for j in range(3):
+                idx = rand_idx[i * 3 + j]
+
+                text = list(texts[idx])
+                pred_output = outputs[idx]
+                pred_output = list(
+                    pred_output[: pred_output.index("\n")].replace(" ", "")
+                    if "\n" in pred_output
+                    else pred_output.replace(" ", "")
+                )
+                attention_map = alignments[idx][:len(pred_output), :len(text)]
+
+                axes[i][j].pcolor(attention_map, cmap=plt.cm.Blues, alpha=0.9)
+
+                xticks = range(0, len(text))
+                axes[i][j].set_xticks(xticks, minor=False)
+                axes[i][j].set_xticklabels("")
+
+                xticks1 = [k + 0.5 for k in xticks]
+                axes[i][j].set_xticks(xticks1, minor=True)
+                axes[i][j].set_xticklabels(
+                    text, minor=True, fontproperties=lang_font_prop
+                )
+
+                yticks = range(0, len(pred_output))
+                axes[i][j].set_yticks(yticks, minor=False)
+                axes[i][j].set_yticklabels("")
+
+                yticks1 = [k + 0.5 for k in yticks]
+                axes[i][j].set_yticks(yticks1, minor=True)
+                axes[i][j].set_yticklabels(
+                    pred_output, minor=True, fontproperties=eng_font_prop
+                )
+
+                axes[i][j].grid(True)
+                axes[i][j].set_title(''.join(text), fontproperties=lang_font_prop)
+
+        fig.tight_layout()
+        plt.show()
