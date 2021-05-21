@@ -65,8 +65,9 @@ class Encoder(Model):
     def call(self, x):
 
         # Passing inputs through embedding layer
-        x = self.embedding(x)
+        self.encoded_inputs = self.embedding(x)
 
+        x = self.encoded_inputs
         # Passing the embeddings through all recurrent layers
         for i in range(self.config["model"]["encoder"]["layers"]):
             x, *states = self.recurrent_layers[i](x)
@@ -326,7 +327,7 @@ class EncoderDecoder:
 
             # Compute validation accuracy on the entire validation set every epoch
             val_accuracy = self.evaluate(
-                val_dataset[1], "val", write_to_file=False, plot_preds=False
+                val_dataset[1], "val", write_to_file=False, make_plots=False
             )
 
             wandb.log(
@@ -336,10 +337,7 @@ class EncoderDecoder:
                 }
             )
 
-        self._plot_attention_maps(val_dataset[1])
-
-
-    def evaluate(self, inputs, title, write_to_file=False, plot_preds=False):
+    def evaluate(self, inputs, title, write_to_file=False, make_plots=False):
 
         inference_batch_size = inputs.shape[0]
 
@@ -463,8 +461,13 @@ class EncoderDecoder:
                 )
 
         # Plot correct and incorrect predictions
-        if plot_preds:
+        if make_plots:
             self._plot_predictions(predictions)
+
+            if self.config["model"]["attention"]:
+                self._plot_attention_maps(inputs, title)
+
+            self._plot_connectivity(inputs, title)
 
         return accuracy
 
@@ -492,6 +495,7 @@ class EncoderDecoder:
 
         fig.tight_layout()
         wandb.log({"Correct & Incorrect Predictions": wandb.Image(fig)})
+        plt.close(fig)
 
     def _plot_table_with_predictions(self, predictions, title, ax):
 
@@ -531,7 +535,7 @@ class EncoderDecoder:
             else:
                 cell.set_facecolor(row_colors[k[0] % len(row_colors)])
 
-    def _plot_attention_maps(self, inputs):
+    def _plot_attention_maps(self, inputs, title):
 
         inference_batch_size = inputs.shape[0]
 
@@ -587,7 +591,7 @@ class EncoderDecoder:
         fig, axes = plt.subplots(3, 3, figsize=(9, 9))
 
         # Getting the inputs and allowed labels
-        labels = self.config["data"]["val_labels"]
+        labels = self.config["data"][title + "_labels"]
         texts = list(labels.keys())
 
         outputs = self.config["data"]["target_lang_tokenizer"].sequences_to_texts(
@@ -610,9 +614,9 @@ class EncoderDecoder:
                     if "\n" in pred_output
                     else pred_output.replace(" ", "")
                 )
-                attention_map = alignments[idx][:len(pred_output), :len(text)]
+                attention_map = alignments[idx][:len(text), :len(pred_output)]
 
-                axes[i][j].pcolor(attention_map, cmap=plt.cm.Blues, alpha=0.9)
+                axes[i][j].pcolor(attention_map.T, cmap=plt.cm.Blues, alpha=0.9)
 
                 xticks = range(0, len(text))
                 axes[i][j].set_xticks(xticks, minor=False)
@@ -638,4 +642,126 @@ class EncoderDecoder:
                 axes[i][j].set_title(''.join(text), fontproperties=lang_font_prop)
 
         fig.tight_layout()
-        plt.show()
+        wandb.log({"Attention Heatmaps": wandb.Image(fig)})
+        plt.close(fig)
+
+    def _plot_connectivity(self, inputs, title):
+
+        idxs = tf.range(tf.shape(inputs)[0])
+        ridxs = tf.random.shuffle(idxs)[:9]
+        rand_inputs = tf.gather(inputs, ridxs)
+
+        inference_batch_size = rand_inputs.shape[0]
+
+        with tf.GradientTape() as tape:
+
+            # Pass the inputs through the encoder network
+            enc_out, states = self.encoder(rand_inputs)
+
+            # Tile the encoder outputs and hidden states for beam search
+            if self.config["model"]["attention"]:
+                self.decoder.attention_mechanism.setup_memory(enc_out)
+                hidden_state = self.decoder.build_initial_state(
+                    inference_batch_size,
+                    states,
+                    tf.float32,
+                )
+            else:
+                if self.config["model"]["cell_type"] != "LSTM":
+                    states = states[0]
+
+                hidden_state = self.decoder.get_initial_state(states)
+
+                if self.config["model"]["decoder"]["layers"] == 1:
+                    hidden_state = (hidden_state,)
+                else:
+                    if self.config["model"]["cell_type"] == "LSTM":
+                        hidden_state = tuple(
+                            [hidden_state[2 * i], hidden_state[2 * i + 1]]
+                            for i in range(int(len(hidden_state) / 2))
+                        )
+                    else:
+                        hidden_state = tuple(hidden_state)
+
+            # Start and end tokens for beam search
+            start_tokens = tf.fill(
+                [inference_batch_size],
+                self.config["data"]["target_lang_tokenizer"].word_index["\t"],
+            )
+            end_token = self.config["data"]["target_lang_tokenizer"].word_index["\n"]
+
+            decoder_embedding_matrix = self.decoder.embedding.variables[0]
+
+            # Running beam search
+            outputs, final_state, sequence_lengths = self.greedy_decoder(
+                decoder_embedding_matrix,
+                start_tokens=start_tokens,
+                end_token=end_token,
+                initial_state=hidden_state,
+            )
+
+        partial_grads = tape.batch_jacobian(outputs.rnn_output, self.encoder.encoded_inputs)
+        encoder_embedding_matrix = self.encoder.embedding.variables[0]
+
+        full_grads = tf.matmul(partial_grads, tf.transpose(encoder_embedding_matrix))
+        connectivity = tf.reduce_sum(full_grads ** 2, axis=[2, 4])
+        connectivity = tf.transpose(connectivity, [0, 2, 1])
+        connectivity = connectivity.numpy()
+
+        fig, axes = plt.subplots(3, 3, figsize=(9, 9))
+
+        # Getting the inputs and allowed labels
+        labels = self.config["data"][title + "_labels"]
+        texts = list(labels.keys())
+
+        outputs = self.config["data"]["target_lang_tokenizer"].sequences_to_texts(
+            outputs.sample_id.numpy()
+        )
+
+        # Getting the font properties to write in English and Devanagri
+        eng_font_prop = fm.FontProperties(fname="./lib/Nirmala.ttf")
+        lang_font_prop = fm.FontProperties(fname="./lib/NotoSansD.ttf")
+
+        rand_idx = ridxs.numpy()
+        for i in range(3):
+            for j in range(3):
+                idx = rand_idx[i * 3 + j]
+
+                text = list(texts[idx])
+                pred_output = outputs[i * 3 + j]
+                pred_output = list(
+                    pred_output[: pred_output.index("\n")].replace(" ", "")
+                    if "\n" in pred_output
+                    else pred_output.replace(" ", "")
+                )
+                attention_map = connectivity[i * 3 + j][:len(text), :len(pred_output)]
+                attention_map = attention_map / np.sum(attention_map, axis=0)
+
+                axes[i][j].pcolor(attention_map.T, cmap=plt.cm.Blues, alpha=0.9)
+
+                xticks = range(0, len(text))
+                axes[i][j].set_xticks(xticks, minor=False)
+                axes[i][j].set_xticklabels("")
+
+                xticks1 = [k + 0.5 for k in xticks]
+                axes[i][j].set_xticks(xticks1, minor=True)
+                axes[i][j].set_xticklabels(
+                    text, minor=True, fontproperties=lang_font_prop
+                )
+
+                yticks = range(0, len(pred_output))
+                axes[i][j].set_yticks(yticks, minor=False)
+                axes[i][j].set_yticklabels("")
+
+                yticks1 = [k + 0.5 for k in yticks]
+                axes[i][j].set_yticks(yticks1, minor=True)
+                axes[i][j].set_yticklabels(
+                    pred_output, minor=True, fontproperties=eng_font_prop
+                )
+
+                axes[i][j].grid(True)
+                axes[i][j].set_title(''.join(text), fontproperties=lang_font_prop)
+
+        fig.tight_layout()
+        wandb.log({"Connectivity": wandb.Image(fig)})
+        plt.close(fig)
