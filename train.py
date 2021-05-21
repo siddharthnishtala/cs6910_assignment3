@@ -73,4 +73,4 @@ train_dataset, val_dataset, test_dataset = load_lexicons(CONFIG)
 # Training and evaluating the model
 model = EncoderDecoder(CONFIG)
 model.train(train_dataset, val_dataset)
-model.evaluate(test_dataset, "test", write_to_file=True, plot_preds=True)
+model.evaluate(test_dataset, "test", write_to_file=True, make_plots=True)
