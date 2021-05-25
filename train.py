@@ -7,15 +7,15 @@ hyperparameter_defaults = dict(
     cell_type="LSTM",
     embedding_dim=64,
     attention=True,
-    encoder_layers=1,
+    encoder_layers=3,
     encoder_dropout=0.0,
     encoder_rec_dropout=0.0,
     decoder_layers=1,
-    hidden_units=64,
+    hidden_units=128,
     beam_width=3,
-    optimizer="Nadam",
-    epochs=20,
-    batch_size=64,
+    optimizer="Adam",
+    epochs=30,
+    batch_size=128,
 )
 
 wandb.init(
@@ -37,6 +37,7 @@ name += config["optimizer"] + "_"
 name += "ep(" + str(config["epochs"]) + ")_"
 name += "bs(" + str(config["batch_size"]) + ")_"
 name += "att_" if config["attention"] else ""
+name += "plot_"
 
 wandb.run.name = name[:-1]
 

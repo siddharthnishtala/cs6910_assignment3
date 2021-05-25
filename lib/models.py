@@ -536,11 +536,16 @@ class EncoderDecoder:
                 cell.set_facecolor(row_colors[k[0] % len(row_colors)])
 
     def _plot_attention_maps(self, inputs, title):
+        
+        # Sample 9 inputs for plots
+        idxs = tf.range(tf.shape(inputs)[0])
+        ridxs = tf.random.shuffle(idxs)[:9]
+        rand_inputs = tf.gather(inputs, ridxs)
 
-        inference_batch_size = inputs.shape[0]
+        inference_batch_size = rand_inputs.shape[0]
 
         # Pass the inputs through the encoder network
-        enc_out, states = self.encoder(inputs)
+        enc_out, states = self.encoder(rand_inputs)
 
         # Tile the encoder outputs and hidden states for beam search
         if self.config["model"]["attention"]:
@@ -584,6 +589,7 @@ class EncoderDecoder:
             initial_state=hidden_state,
         )
 
+        # Collecting attention weights
         alignments = tf.transpose(final_state.alignment_history.stack(), [1, 2, 0])
 
         alignments = alignments.numpy()
@@ -602,20 +608,23 @@ class EncoderDecoder:
         eng_font_prop = fm.FontProperties(fname="./lib/Nirmala.ttf")
         lang_font_prop = fm.FontProperties(fname="./lib/NotoSansD.ttf")
 
-        rand_idx = np.random.permutation(alignments.shape[0])[:9]
+        rand_idx = ridxs.numpy()
         for i in range(3):
             for j in range(3):
                 idx = rand_idx[i * 3 + j]
 
                 text = list(texts[idx])
-                pred_output = outputs[idx]
+                pred_output = outputs[i * 3 + j]
                 pred_output = list(
                     pred_output[: pred_output.index("\n")].replace(" ", "")
                     if "\n" in pred_output
                     else pred_output.replace(" ", "")
                 )
-                attention_map = alignments[idx][:len(text), :len(pred_output)]
 
+                # Slicing to get the relevant attention values
+                attention_map = alignments[i * 3 + j][8:8+len(text), :len(pred_output)]
+                
+                # Heatmap
                 axes[i][j].pcolor(attention_map.T, cmap=plt.cm.Blues, alpha=0.9)
 
                 xticks = range(0, len(text))
@@ -647,6 +656,7 @@ class EncoderDecoder:
 
     def _plot_connectivity(self, inputs, title):
 
+        # Sample 9 inputs for plots
         idxs = tf.range(tf.shape(inputs)[0])
         ridxs = tf.random.shuffle(idxs)[:9]
         rand_inputs = tf.gather(inputs, ridxs)
@@ -700,9 +710,11 @@ class EncoderDecoder:
                 initial_state=hidden_state,
             )
 
+        # Getting the jacobian for each example 
         partial_grads = tape.batch_jacobian(outputs.rnn_output, self.encoder.encoded_inputs)
         encoder_embedding_matrix = self.encoder.embedding.variables[0]
 
+        # Computing connectivity (as given in the accompanying blog)
         full_grads = tf.matmul(partial_grads, tf.transpose(encoder_embedding_matrix))
         connectivity = tf.reduce_sum(full_grads ** 2, axis=[2, 4])
         connectivity = tf.transpose(connectivity, [0, 2, 1])
@@ -734,11 +746,14 @@ class EncoderDecoder:
                     if "\n" in pred_output
                     else pred_output.replace(" ", "")
                 )
-                attention_map = connectivity[i * 3 + j][:len(text), :len(pred_output)]
-                attention_map = attention_map / np.sum(attention_map, axis=0)
 
-                axes[i][j].pcolor(attention_map.T, cmap=plt.cm.Blues, alpha=0.9)
+                # Slicing to get plots for the word and normalizing the result
+                connectivity_map = connectivity[i * 3 + j][:len(text), :len(pred_output)]
+                connectivity_map = connectivity_map / np.sum(connectivity_map, axis=0)
 
+                # Heatmap
+                axes[i][j].pcolor(connectivity_map.T, cmap=plt.cm.Blues, alpha=0.9)
+ 
                 xticks = range(0, len(text))
                 axes[i][j].set_xticks(xticks, minor=False)
                 axes[i][j].set_xticklabels("")
