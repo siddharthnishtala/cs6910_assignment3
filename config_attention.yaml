@@ -1,0 +1,32 @@
+entity: iitm-cs6910
+project: CS6910-Assignment-3
+program: train.py
+method: bayes
+metric:
+  goal: maximize
+  name: val_accuracy
+parameters:
+  cell_type:
+    values: ["RNN", "LSTM", "GRU"]
+  embedding_dim:
+    values: [32, 64, 128, 256]
+  attention:
+    values: [True]
+  encoder_layers:
+    values: [1, 2, 3]
+  encoder_dropout:
+    values: [0, 0.125, 0.25, 0.375, 0.5]
+  encoder_rec_dropout:
+    values: [0, 0.125, 0.25, 0.375, 0.5]
+  decoder_layers:
+    values: [1, 2, 3]
+  hidden_units:
+    values: [32, 64, 128, 256]
+  beam_width:
+    values: [3, 5, 7]
+  optimizer:
+    values: ["Adam", "Nadam", "Momentum"]
+  epochs:
+    values: [10, 20, 30, 40]
+  batch_size:
+    values: [32, 64, 128, 256]
